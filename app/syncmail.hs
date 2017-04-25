@@ -27,6 +27,9 @@ import qualified Data.UUID.V4 as UUID
 import qualified Data.UUID as UUID
 default (T.Text)
 
+home :: T.Text
+home = "/Users/dbp"
+
 data Request = Noop | CheckFiles | SyncInbox | SyncAll deriving Show
 
 instance Monoid Request where
@@ -52,8 +55,7 @@ imapThread chan cvar = do
   msg <- atomically . RQ.read . untaggedQueue $ conn
   case msg of
     (Exists _, _) -> atomically $ writeTBQueue chan SyncInbox
-    r -> do print r
-            return ()
+    r -> return ()
   log' "Imap ack."
   imapThread chan cvar
 
@@ -63,7 +65,7 @@ connect :: IO IMAPConnection
 connect = do let tls = TLSSettingsSimple False False False
              let params = ConnectionParams "imap.fastmail.com" 993 (Just tls) Nothing
              conn <- connectServer params Nothing
-             pass <- last . T.words . head . T.lines <$> T.readFile "/Users/dbp/.authinfo"
+             pass <- last . T.words . head . T.lines <$> T.readFile (T.unpack $ home <> "/.authinfo")
              r <- simpleFormat $ login conn "dbp@dbpmail.net" pass
              log' $ "Logging in... " <> case r of
                                           Right _ -> ""
@@ -107,31 +109,48 @@ getNewName curname dir = do uuid <- liftIO UUID.nextRandom
 
 
 moveMail :: Sh Request
-moveMail = do files <- T.lines <$> run "notmuch" ["search",
+moveMail = do -- 1. Remove duplicates caused by sending to self (anytime it means identical message id).
+              files' <- T.lines <$> run "notmuch" ["search",
+                                                  "--output=files", "--duplicate=2",
+                                                  "folder:inbox", "and",
+                                                  "tag:sent"]
+              -- NOTE(dbp 2017-04-25): The documentation is unclear; it seems
+              -- like the above might return both sometimes, but it seems to
+              -- only return the copy that is in the folder: query (so this is
+              -- redundant).
+              let files = filter (T.isPrefixOf (home <> "/mail/inbox")) files'
+              r0 <- case files of
+                      [] -> return Noop
+                      _ -> do mapM_ (rm . fromText) files
+                              run_ "notmuch" ["new", "--quiet"]
+                              return SyncAll
+              -- 2. Move files to archive that have been archived.
+              files <- T.lines <$> run "notmuch" ["search",
                                                   "--output=files",
                                                   "folder:inbox", "and",
                                                   "not", "tag:inbox"]
               r1 <- case files of
                       [] -> return Noop
                       _ -> do mapM_ (\f -> do
-                                        target <- getNewName f "/Users/dbp/mail/archive/cur/"
+                                        target <- getNewName f (home <> "/mail/archive/cur/")
                                         mv (fromText f) (fromText target))
                                 files 
                               run_ "notmuch" ["new", "--quiet"]
                               return SyncAll
+              -- 3. Move files into the inbox that weren't there but have been tagged.
               files <- T.lines <$> run "notmuch" ["search",
                                                   "--output=files",
                                                   "not", "folder:inbox",
-                                                  "and", "tag:inbox"] 
+                                                  "and", "tag:inbox"]
               r2 <- case files of
                       [] -> return Noop
                       _ -> do mapM_ (\f -> do
-                                        target <- getNewName f "/Users/dbp/mail/inbox/cur/"
+                                        target <- getNewName f (home <> "/mail/inbox/cur/")
                                         mv (fromText f) (fromText target))
                                 files
                               run_ "notmuch" ["new", "--quiet"]
                               return SyncAll
-              return (r1 <> r2)
+              return (r0 <> r1 <> r2)
 
 data Summary = Summary T.Text T.Text deriving Show
 instance FromJSON Summary where
@@ -146,11 +165,12 @@ notifyNewMail = do
   msgs' <- decode . TL.encodeUtf8 . TL.fromStrict <$>
     run "notmuch" ["search", "--format=json",
                     "tag:inbox", "and",
-                    "tag:unprocessed"]
+                    "tag:unprocessed", "and",
+                    "tag:unread"]
   let msgs = fromMaybe [] msgs' :: [Summary]
   when (not $ null msgs) $ liftIO (log' "Notifying of new messages...")
   mapM_ (\(Summary auth sub) ->
-           asyncSh $ run_ "terminal-notifier" ["-message",sub,"-title",auth,"-sender", "org.gnu.Emacs", "-activate", "org.gnu.Emacs", "-actions","''", "-timeout", "60"])
+           asyncSh $ run_ "terminal-notifier" ["-message",sub,"-title",auth,"-sender", "org.gnu.Emacs", "-activate", "org.gnu.Emacs", "-timeout", "60"])
     msgs
   run_ "notmuch" ["tag", "-unprocessed", "tag:unprocessed"]
 
@@ -209,8 +229,3 @@ main = withStdoutLogging $ do
   forkIO $ syncThread chan
   forkIO $ filesThread chan
   forever $ periodicThread chan 
-
-
--- Local Variables:
--- mode: haskell
--- End:
