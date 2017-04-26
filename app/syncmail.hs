@@ -74,8 +74,9 @@ connect = do let tls = TLSSettingsSimple False False False
              simpleFormat $ sendCommand conn "IDLE"
              return conn
 
-keepAliveThread :: TVar IMAPConnection -> IO ()
-keepAliveThread cvar = do conn <- readTVarIO cvar
+
+reconnectThread :: TVar IMAPConnection -> IO ()
+reconnectThread cvar = do conn <- readTVarIO cvar
                           status <- readTVarIO (connectionState conn)
                           let reconnect = do
                                log' "Reconnecting to server..."
@@ -87,7 +88,14 @@ keepAliveThread cvar = do conn <- readTVarIO cvar
                             Disconnected -> reconnect
                             UndefinedState -> reconnect
                             Connected -> return ()
-                          threadDelay (13 * oneMinute)
+                          threadDelay (oneMinute `div` 6)
+                          log' "Reconnect ack."
+                          reconnectThread cvar
+
+
+keepAliveThread :: TVar IMAPConnection -> IO ()
+keepAliveThread cvar = do threadDelay (13 * oneMinute)
+                          conn <- readTVarIO cvar
                           sendCommand conn "DONE"
                           sendCommand conn "IDLE"
                           log' "Keepalive ack."
@@ -225,6 +233,7 @@ main = withStdoutLogging $ do
   cvar <- newTVarIO conn
   chan <- atomically $ newTBQueue 10
   forkIO $ imapThread chan cvar
+  forkIO $ reconnectThread cvar
   forkIO $ keepAliveThread cvar
   forkIO $ syncThread chan
   forkIO $ filesThread chan
