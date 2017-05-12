@@ -25,6 +25,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import qualified Data.UUID.V4 as UUID
 import qualified Data.UUID as UUID
+import Data.Time.Clock
 default (T.Text)
 
 home :: T.Text
@@ -75,22 +76,28 @@ connect = do let tls = TLSSettingsSimple False False False
              return conn
 
 
-reconnectThread :: TVar IMAPConnection -> IO ()
-reconnectThread cvar = do conn <- readTVarIO cvar
-                          status <- readTVarIO (connectionState conn)
-                          let reconnect = do
-                               log' "Reconnecting to server..."
-                               newconn <- connect
-                               atomically $ writeTVar cvar newconn
-                               close conn
-                               return ()
-                          case status of
-                            Disconnected -> reconnect
-                            UndefinedState -> reconnect
-                            Connected -> return ()
-                          threadDelay (oneMinute `div` 6)
-                          log' "Reconnect ack."
-                          reconnectThread cvar
+reconnectThread :: TVar UTCTime -> TVar IMAPConnection -> IO ()
+reconnectThread lastchecked cvar =
+  do conn <- readTVarIO cvar
+     status <- readTVarIO (connectionState conn)
+     let reconnect = do
+          log' "Reconnecting to server..."
+          newconn <- connect
+          atomically $ writeTVar cvar newconn
+          close conn
+          return ()
+     case status of
+       Disconnected -> reconnect
+       UndefinedState -> reconnect
+       Connected -> do last <- readTVarIO lastchecked
+                       now <- getCurrentTime
+                       atomically $ writeTVar lastchecked now
+                       if diffUTCTime now last > fromIntegral (13 * oneMinute)
+                       then reconnect
+                       else return () 
+     threadDelay (oneMinute `div` 6)
+     log' "Reconnect ack."
+     reconnectThread lastchecked cvar
 
 
 keepAliveThread :: TVar IMAPConnection -> IO ()
@@ -177,7 +184,8 @@ notifyNewMail = do
                     "tag:unread"]
   let msgs = fromMaybe [] msgs' :: [Summary]
   when (not $ null msgs) $ liftIO (log' "Notifying of new messages...")
-  mapM_ (\(Summary auth sub) ->
+  mapM_ (\(Summary auth sub') ->
+           let sub = if "[" `T.isPrefixOf` sub' then T.append "\\" sub' else sub' in
            asyncSh $ run_ "terminal-notifier" ["-message",sub,"-title",auth,"-sender", "org.gnu.Emacs", "-activate", "org.gnu.Emacs", "-timeout", "60"])
     msgs
   run_ "notmuch" ["tag", "-unprocessed", "tag:unprocessed"]
@@ -232,8 +240,10 @@ main = withStdoutLogging $ do
   conn <- connect
   cvar <- newTVarIO conn
   chan <- atomically $ newTBQueue 10
+  now <- getCurrentTime
+  lastchecked <- newTVarIO now
   forkIO $ imapThread chan cvar
-  forkIO $ reconnectThread cvar
+  forkIO $ reconnectThread lastchecked  cvar
   forkIO $ keepAliveThread cvar
   forkIO $ syncThread chan
   forkIO $ filesThread chan
