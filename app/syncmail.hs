@@ -1,31 +1,33 @@
 #!/usr/bin/env stack
 -- stack --resolver lts-7.9 --install-ghc runghc --package imap-0.3.0.0 --package rolling-queue-0.1 --package monadIO-0.10.1.4 --package shelly --package logging --package aeson --package ekg
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ExtendedDefaultRules #-}
+{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE ScopedTypeVariables  #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module Main where
 
-import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Encoding as TL
-import Data.Maybe
-import Data.Aeson
-import Data.Aeson.Types
-import Control.Logging
-import Shelly
-import qualified Data.Text.IO as T
-import qualified Data.Text as T
-import Control.Monad
-import Network.Connection
-import Network.IMAP
-import Network.IMAP.Types
-import qualified Data.STM.RollingQueue as RQ
-import Control.Concurrent.STM.TBQueue
-import Data.Monoid
-import Control.Concurrent
-import Control.Concurrent.STM
-import qualified Data.UUID.V4 as UUID
-import qualified Data.UUID as UUID
-import Data.Time.Clock
+import           Control.Concurrent
+import           Control.Concurrent.STM
+import           Control.Concurrent.STM.TBQueue
+import           Control.Exception              (SomeException, catch)
+import           Control.Logging
+import           Control.Monad
+import           Data.Aeson
+import           Data.Aeson.Types
+import           Data.Maybe
+import           Data.Monoid
+import qualified Data.STM.RollingQueue          as RQ
+import qualified Data.Text                      as T
+import qualified Data.Text.IO                   as T
+import qualified Data.Text.Lazy                 as TL
+import qualified Data.Text.Lazy.Encoding        as TL
+import           Data.Time.Clock
+import qualified Data.UUID                      as UUID
+import qualified Data.UUID.V4                   as UUID
+import           Network.Connection
+import           Network.IMAP
+import           Network.IMAP.Types
+import           Shelly
 default (T.Text)
 
 home :: T.Text
@@ -35,12 +37,12 @@ data Request = Noop | CheckFiles | SyncInbox | SyncAll deriving Show
 
 instance Monoid Request where
   mempty = Noop
-  mappend Noop r = r
-  mappend r Noop = r
-  mappend SyncAll _ = SyncAll
-  mappend _ SyncAll = SyncAll
-  mappend _ SyncInbox = SyncInbox
-  mappend SyncInbox _ = SyncInbox
+  mappend Noop r                = r
+  mappend r Noop                = r
+  mappend SyncAll _             = SyncAll
+  mappend _ SyncAll             = SyncAll
+  mappend _ SyncInbox           = SyncInbox
+  mappend SyncInbox _           = SyncInbox
   mappend CheckFiles CheckFiles = CheckFiles
 
 readAll :: TBQueue a -> IO [a]
@@ -48,7 +50,7 @@ readAll q = atomically $ readAll' True
   where readAll' isFirst = do val <- if isFirst then Just <$> readTBQueue q else tryReadTBQueue q
                               case val of
                                 Nothing -> return []
-                                Just v -> (v :) <$> readAll' False
+                                Just v  -> (v :) <$> readAll' False
 
 imapThread :: TBQueue Request -> TVar IMAPConnection -> IO ()
 imapThread chan cvar = do
@@ -56,7 +58,7 @@ imapThread chan cvar = do
   msg <- atomically . RQ.read . untaggedQueue $ conn
   case msg of
     (Exists _, _) -> atomically $ writeTBQueue chan SyncInbox
-    r -> return ()
+    r             -> return ()
   log' "Imap ack."
   imapThread chan cvar
 
@@ -69,20 +71,26 @@ connect = do let tls = TLSSettingsSimple False False False
              pass <- last . T.words . head . T.lines <$> T.readFile (T.unpack $ home <> "/.authinfo")
              r <- simpleFormat $ login conn "dbp@dbpmail.net" pass
              log' $ "Logging in... " <> case r of
-                                          Right _ -> ""
+                                          Right _  -> ""
                                           Left err -> T.pack (show err)
              simpleFormat $ select conn "INBOX"
              simpleFormat $ sendCommand conn "IDLE"
              return conn
 
+retryTenSeconds :: IO a -> IO a
+retryTenSeconds f = catch f $ \(e::SomeException) -> do
+  log' $ "Exception raised: " <> T.pack (show e) <> ", sleeping and retrying."
+  threadDelay (oneMinute `div` 6)
+  retryTenSeconds f
 
 reconnectThread :: TVar UTCTime -> TVar IMAPConnection -> IO ()
 reconnectThread lastchecked cvar =
   do conn <- readTVarIO cvar
      status <- readTVarIO (connectionState conn)
+     log' "Reconnect ack."
      let reconnect = do
           log' "Reconnecting to server..."
-          newconn <- connect
+          newconn <- retryTenSeconds connect
           atomically $ writeTVar cvar newconn
           close conn
           return ()
@@ -92,11 +100,19 @@ reconnectThread lastchecked cvar =
        Connected -> do last <- readTVarIO lastchecked
                        now <- getCurrentTime
                        atomically $ writeTVar lastchecked now
-                       if diffUTCTime now last > fromIntegral (13 * oneMinute)
+                       log' $ "Checked " <> (T.pack (show (diffUTCTime now last))) <> " ago."
+                       -- NOTE(dbp 2017-05-22): Conversion to NominalDiffTime is
+                       -- in seconds, So since we delay for 10 seconds, more
+                       -- than 20 means there was a gap (likely, computer went
+                       -- to sleep, so connection might have been lost). This is
+                       -- needed because the IMAP library doesn't seem to detect
+                       -- that, and it will continue to report that we are
+                       -- "connected" even when we clearly aren't (and will thus
+                       -- stop getting push notifications).
+                       if diffUTCTime now last > 60
                        then reconnect
-                       else return () 
+                       else return ()
      threadDelay (oneMinute `div` 6)
-     log' "Reconnect ack."
      reconnectThread lastchecked cvar
 
 
@@ -149,7 +165,7 @@ moveMail = do -- 1. Remove duplicates caused by sending to self (anytime it mean
                       _ -> do mapM_ (\f -> do
                                         target <- getNewName f (home <> "/mail/archive/cur/")
                                         mv (fromText f) (fromText target))
-                                files 
+                                files
                               run_ "notmuch" ["new", "--quiet"]
                               return SyncAll
               -- 3. Move files into the inbox that weren't there but have been tagged.
@@ -247,4 +263,4 @@ main = withStdoutLogging $ do
   forkIO $ keepAliveThread cvar
   forkIO $ syncThread chan
   forkIO $ filesThread chan
-  forever $ periodicThread chan 
+  forever $ periodicThread chan
