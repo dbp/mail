@@ -28,10 +28,12 @@ import           Network.Connection
 import           Network.IMAP
 import           Network.IMAP.Types
 import           Shelly
+import           System.Environment             (getEnv)
+import           System.IO.Unsafe               (unsafePerformIO)
 default (T.Text)
 
 home :: T.Text
-home = "/Users/dbp"
+home = T.pack $ unsafePerformIO (getEnv "HOME")
 
 data Request = Noop | CheckFiles | SyncInbox | SyncAll deriving Show
 
@@ -128,6 +130,8 @@ updateNotMuch :: Sh ()
 updateNotMuch = do run_ "notmuch" ["new", "--quiet"]
                    run_ "notmuch" ["tag", "-inbox",
                                    "folder:sent", "and", "tag:inbox"]
+                   run_ "notmuch" ["tag", "-unread",
+                                   "folder:sent", "and", "tag:unread"]
                    run_ "notmuch" ["tag", "+sent",
                                    "folder:sent", "and", "not", "tag:sent"]
                    run_ "notmuch" ["tag", "-inbox",
@@ -202,7 +206,10 @@ notifyNewMail = do
   when (not $ null msgs) $ liftIO (log' "Notifying of new messages...")
   mapM_ (\(Summary auth sub') ->
            let sub = if "[" `T.isPrefixOf` sub' then T.append "\\" sub' else sub' in
-           asyncSh $ run_ "terminal-notifier" ["-message",sub,"-title",auth,"-sender", "org.gnu.Emacs", "-activate", "org.gnu.Emacs", "-timeout", "60"])
+           -- asyncSh $ run_ "terminal-notifier" ["-message",sub,"-title",auth,"-sender", "org.gnu.Emacs", "-activate", "org.gnu.Emacs", "-timeout", "60"]
+           asyncSh $ run_ "notify-send" ["-t", "10000", auth, sub]
+           )
+
     msgs
   run_ "notmuch" ["tag", "-unprocessed", "tag:unprocessed"]
 
