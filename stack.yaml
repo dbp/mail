@@ -1,12 +1,14 @@
-resolver: lts-7.9
+resolver: lts-8.17
 
 packages:
 - '.'
 extra-deps:
-- imap-0.3.0.0
-- rolling-queue-0.1
-- monadIO-0.10.1.4
+- imap-0.3.0.5
 - logging-3.0.4
+- monadIO-0.10.1.4
+- rolling-queue-0.1
+
+allow-newer: true # problems due to imap and oldest version of ghc still supported
 
 flags: {}
 
