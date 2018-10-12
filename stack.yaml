@@ -1,13 +1,15 @@
-resolver: lts-7.9
+resolver: lts-12.12
 
 packages:
 - '.'
 extra-deps:
-- imap-0.3.0.0
+- imap-0.3.0.8
+- logging-3.0.5
 - rolling-queue-0.1
-- monadIO-0.10.1.4
-- logging-3.0.4
+- exceptions-0.8.3
 
 flags: {}
 
 extra-package-dbs: []
+
+# allow-newer: true

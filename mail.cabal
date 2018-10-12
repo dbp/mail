@@ -18,7 +18,7 @@ executable mail
   build-depends:       base
                      , imap
                      , rolling-queue
-                     , monadIO
+                     -- , monadIO
                      , shelly
                      , logging
                      , aeson
@@ -27,6 +27,8 @@ executable mail
                      , stm
                      , uuid
                      , time
+                     , capataz
+                     , rio
   default-language:    Haskell2010
 
 

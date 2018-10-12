@@ -6,16 +6,25 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 module Main where
 
+import           Capataz                        (Capataz, WorkerId, WorkerRestartStrategy (Permanent),
+                                                 buildWorkerOptions,
+                                                 forkCapataz, forkWorker,
+                                                 joinCapatazThread,
+                                                 onSystemEventL, set,
+                                                 terminateCapataz_,
+                                                 terminateProcess,
+                                                 workerRestartStrategyL)
 import           Control.Concurrent
 import           Control.Concurrent.STM
 import           Control.Concurrent.STM.TBQueue
-import           Control.Exception              (SomeException, catch)
+import           Control.Exception              (SomeException, catch, finally)
 import           Control.Logging
 import           Control.Monad
 import           Data.Aeson
 import           Data.Aeson.Types
 import           Data.Maybe
 import           Data.Monoid
+import           Data.Semigroup
 import qualified Data.STM.RollingQueue          as RQ
 import qualified Data.Text                      as T
 import qualified Data.Text.IO                   as T
@@ -27,8 +36,11 @@ import qualified Data.UUID.V4                   as UUID
 import           Network.Connection
 import           Network.IMAP
 import           Network.IMAP.Types
+import           RIO                            (display, utf8BuilderToText)
 import           Shelly
+
 default (T.Text)
+
 
 home :: T.Text
 home = "/Users/dbp"
@@ -45,6 +57,9 @@ instance Monoid Request where
   mappend SyncInbox _           = SyncInbox
   mappend CheckFiles CheckFiles = CheckFiles
 
+instance Semigroup Request where
+  (<>) = mappend
+
 readAll :: TBQueue a -> IO [a]
 readAll q = atomically $ readAll' True
   where readAll' isFirst = do val <- if isFirst then Just <$> readTBQueue q else tryReadTBQueue q
@@ -54,7 +69,14 @@ readAll q = atomically $ readAll' True
 
 imapThread :: TBQueue Request -> TVar IMAPConnection -> IO ()
 imapThread chan cvar = do
-  conn <- readTVarIO cvar
+  conn' <- readTVarIO cvar
+  status <- readTVarIO (connectionState conn')
+  conn <- case status of
+            Connected -> return conn'
+            _ -> do newconn <- connect
+                    atomically $ writeTVar cvar newconn
+                    close conn'
+                    return newconn
   msg <- atomically . RQ.read . untaggedQueue $ conn
   case msg of
     (Exists _, _) -> atomically $ writeTBQueue chan SyncInbox
@@ -83,16 +105,14 @@ retryTenSeconds f = catch f $ \(e::SomeException) -> do
   threadDelay (oneMinute `div` 6)
   retryTenSeconds f
 
-reconnectThread :: TVar UTCTime -> TVar IMAPConnection -> IO ()
-reconnectThread lastchecked cvar =
+reconnectThread :: Capataz IO -> WorkerId -> TVar UTCTime -> TVar IMAPConnection -> IO ()
+reconnectThread super imapid lastchecked cvar =
   do conn <- readTVarIO cvar
      status <- readTVarIO (connectionState conn)
      log' "Reconnect ack."
      let reconnect = do
           log' "Reconnecting to server..."
-          newconn <- retryTenSeconds connect
-          atomically $ writeTVar cvar newconn
-          close conn
+          terminateProcess "Need to reconnect" imapid super
           return ()
      case status of
        Disconnected -> reconnect
@@ -113,11 +133,11 @@ reconnectThread lastchecked cvar =
                        then reconnect
                        else return ()
      threadDelay (oneMinute `div` 6)
-     reconnectThread lastchecked cvar
+     reconnectThread super imapid lastchecked cvar
 
 
 keepAliveThread :: TVar IMAPConnection -> IO ()
-keepAliveThread cvar = do threadDelay (13 * oneMinute)
+keepAliveThread cvar = do threadDelay (9 * oneMinute)
                           conn <- readTVarIO cvar
                           sendCommand conn "DONE"
                           sendCommand conn "IDLE"
@@ -252,15 +272,21 @@ filesThread chan = do atomically $ writeTBQueue chan CheckFiles
 
 main :: IO ()
 main = withStdoutLogging $ do
+  capataz <- forkCapataz "main-supervisor" (set onSystemEventL (log' . utf8BuilderToText . display))
+
   -- forkServer "localhost" 8000
   conn <- connect
   cvar <- newTVarIO conn
   chan <- atomically $ newTBQueue 10
   now <- getCurrentTime
   lastchecked <- newTVarIO now
-  forkIO $ imapThread chan cvar
-  forkIO $ reconnectThread lastchecked  cvar
-  forkIO $ keepAliveThread cvar
-  forkIO $ syncThread chan
-  forkIO $ filesThread chan
-  forever $ periodicThread chan
+  let fork nm thunk = forkWorker (buildWorkerOptions nm thunk (set workerRestartStrategyL Permanent)) capataz
+  imapid <- fork "imap" $ imapThread chan cvar
+  fork "reconnect" $ reconnectThread capataz imapid lastchecked  cvar
+  fork "reconnect" $ keepAliveThread cvar
+  fork "sync" $ syncThread chan
+  fork "files" $ filesThread chan
+  fork "periodic" $ periodicThread chan
+  finally
+    (joinCapatazThread capataz)
+    (terminateCapataz_ capataz)
